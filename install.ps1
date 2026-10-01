@@ -9,6 +9,7 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
 
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Updating git submodules..."
+        git -C $scriptDir submodule sync --recursive
         git -C $scriptDir submodule update --init --recursive
 
         if ($LASTEXITCODE -ne 0) {
