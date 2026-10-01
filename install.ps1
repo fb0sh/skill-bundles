@@ -3,6 +3,26 @@ $ErrorActionPreference = "Stop"
 $scriptDir = $PSScriptRoot
 $targetDir = Join-Path $HOME ".agents\skills"
 
+# Some skills are pinned as git submodules; make sure they are present first.
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    git -C $scriptDir rev-parse --is-inside-work-tree 2>$null | Out-Null
+
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Updating git submodules..."
+        git -C $scriptDir submodule update --init --recursive
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "git submodule update failed with exit code $LASTEXITCODE"
+        }
+    }
+    else {
+        Write-Warning "Not a git checkout; skipping submodule update"
+    }
+}
+else {
+    Write-Warning "git not found; skipping submodule update"
+}
+
 # Recursively create ~/.agents/skills
 [System.IO.Directory]::CreateDirectory($targetDir) | Out-Null
 
