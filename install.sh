@@ -1,40 +1,41 @@
-$ErrorActionPreference = "Stop"
+#!/usr/bin/env bash
 
-$baseDir   = Join-Path $PSScriptRoot "base"
-$targetDir = Join-Path $HOME ".agents\skills"
+set -euo pipefail
 
-# Create ~/.agents/skills recursively
-[System.IO.Directory]::CreateDirectory($targetDir) | Out-Null
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$SCRIPT_DIR/base"
+TARGET_DIR="$HOME/.agents/skills"
 
-if (-not (Test-Path -LiteralPath $baseDir -PathType Container)) {
-    throw "Bundle directory does not exist: $baseDir"
-}
+mkdir -p "$TARGET_DIR"
 
-Get-ChildItem -LiteralPath $baseDir -Directory | ForEach-Object {
-    $skillDir = $_.FullName
-    $manifest = Join-Path $skillDir "SKILL.md"
+if [[ ! -d "$BASE_DIR" ]]; then
+    echo "Error: bundle directory does not exist: $BASE_DIR" >&2
+    exit 1
+fi
 
-    if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
-        Write-Warning "Skipped $($_.Name): SKILL.md not found"
-        return
-    }
+bundle_name="$(basename "$BASE_DIR")"
 
-    $linkPath = Join-Path $targetDir $_.Name
-    $existing = Get-Item -LiteralPath $linkPath -Force -ErrorAction SilentlyContinue
+for skill_dir in "$BASE_DIR"/*; do
+    [[ -d "$skill_dir" ]] || continue
 
-    if ($existing) {
-        if ($existing.LinkType -in @("SymbolicLink", "Junction")) {
-            Remove-Item -LiteralPath $linkPath -Force
-        }
-        else {
-            throw "Target already exists and is not a link: $linkPath"
-        }
-    }
+    skill_name="$(basename "$skill_dir")"
+    skill_label="$bundle_name/$skill_name"
+    manifest="$skill_dir/SKILL.md"
+    link_path="$TARGET_DIR/$skill_name"
 
-    New-Item `
-        -ItemType Junction `
-        -Path $linkPath `
-        -Target $skillDir | Out-Null
+    if [[ ! -f "$manifest" ]]; then
+        echo "Skipped: $skill_label (SKILL.md not found)"
+        continue
+    fi
 
-    Write-Host "Linked: $($_.Name) -> $skillDir"
-}
+    if [[ -L "$link_path" ]]; then
+        rm "$link_path"
+    elif [[ -e "$link_path" ]]; then
+        echo "Error: target already exists and is not a symlink: $link_path" >&2
+        exit 1
+    fi
+
+    ln -s "$skill_dir" "$link_path"
+
+    echo "Linked: $skill_label -> $link_path"
+done
