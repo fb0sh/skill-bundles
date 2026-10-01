@@ -3,39 +3,36 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-BASE_DIR="$SCRIPT_DIR/base"
 TARGET_DIR="$HOME/.agents/skills"
 
 mkdir -p "$TARGET_DIR"
 
-if [[ ! -d "$BASE_DIR" ]]; then
-    echo "Error: bundle directory does not exist: $BASE_DIR" >&2
-    exit 1
-fi
+for bundle_dir in "$SCRIPT_DIR"/*; do
+    [[ -d "$bundle_dir" ]] || continue
 
-bundle_name="$(basename "$BASE_DIR")"
+    bundle_name="$(basename "$bundle_dir")"
 
-for skill_dir in "$BASE_DIR"/*; do
-    [[ -d "$skill_dir" ]] || continue
+    for skill_dir in "$bundle_dir"/*; do
+        [[ -d "$skill_dir" ]] || continue
 
-    skill_name="$(basename "$skill_dir")"
-    skill_label="$bundle_name/$skill_name"
-    manifest="$skill_dir/SKILL.md"
-    link_path="$TARGET_DIR/$skill_name"
+        skill_name="$(basename "$skill_dir")"
+        manifest="$skill_dir/SKILL.md"
 
-    if [[ ! -f "$manifest" ]]; then
-        echo "Skipped: $skill_label (SKILL.md not found)"
-        continue
-    fi
+        # A valid skill must contain SKILL.md
+        [[ -f "$manifest" ]] || continue
 
-    if [[ -L "$link_path" ]]; then
-        rm "$link_path"
-    elif [[ -e "$link_path" ]]; then
-        echo "Error: target already exists and is not a symlink: $link_path" >&2
-        exit 1
-    fi
+        skill_label="$bundle_name/$skill_name"
+        link_path="$TARGET_DIR/$skill_name"
 
-    ln -s "$skill_dir" "$link_path"
+        if [[ -L "$link_path" ]]; then
+            rm "$link_path"
+        elif [[ -e "$link_path" ]]; then
+            echo "Error: target already exists and is not a symlink: $link_path" >&2
+            exit 1
+        fi
 
-    echo "Linked: $skill_label -> $link_path"
+        ln -s "$skill_dir" "$link_path"
+
+        echo "Linked: $skill_label -> $link_path"
+    done
 done
