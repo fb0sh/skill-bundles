@@ -8,43 +8,22 @@ uses the session's Claude Code auth, no separate ANTHROPIC_API_KEY needed).
 
 import argparse
 import json
-import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 
+from scripts.llm_cli import run_text
 from scripts.utils import parse_skill_md
 
 
 def _call_claude(prompt: str, model: str | None, timeout: int = 300) -> str:
-    """Run `claude -p` with the prompt on stdin and return the text response.
+    """Ask the configured LLM CLI for a text response.
 
     Prompt goes over stdin (not argv) because it embeds the full SKILL.md
-    body and can easily exceed comfortable argv length.
+    body and can easily exceed comfortable argv length.  The CLI is `pi` by
+    default; see scripts/llm_cli.py and SKILL_CREATOR_CLI.
     """
-    cmd = ["claude", "-p", "--output-format", "text"]
-    if model:
-        cmd.extend(["--model", model])
-
-    # Remove CLAUDECODE env var to allow nesting claude -p inside a
-    # Claude Code session. The guard is for interactive terminal conflicts;
-    # programmatic subprocess usage is safe. Same pattern as run_eval.py.
-    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
-
-    result = subprocess.run(
-        cmd,
-        input=prompt,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=timeout,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"claude -p exited {result.returncode}\nstderr: {result.stderr}"
-        )
-    return result.stdout
+    return run_text(prompt, model=model, timeout=timeout)
 
 
 def improve_description(

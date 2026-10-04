@@ -11,25 +11,153 @@ import os
 import select
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+from scripts.llm_cli import active_cli, pi_launch_args
 from scripts.utils import parse_skill_md
 
 
 def find_project_root() -> Path:
-    """Find the project root by walking up from cwd looking for .claude/.
+    """Return the directory the trigger probe runs in.
 
-    Mimics how Claude Code discovers its project root, so the command file
-    we create ends up where claude -p will look for it.
+    The Claude path needs a directory whose `.claude/` Claude Code will read,
+    so it walks up looking for one.  The pi path only needs a scratch directory
+    to hold the candidate skill, so it makes a fresh temporary one.
     """
-    current = Path.cwd()
-    for parent in [current, *current.parents]:
-        if (parent / ".claude").is_dir():
-            return parent
-    return current
+    if active_cli() == "claude":
+        current = Path.cwd()
+        for parent in [current, *current.parents]:
+            if (parent / ".claude").is_dir():
+                return parent
+        return current
+    return Path(tempfile.mkdtemp(prefix="skill-trigger-eval-"))
+
+
+def _run_single_query_pi(
+    query: str,
+    clean_name: str,
+    skill_name: str,
+    skill_description: str,
+    timeout: int,
+    project_root: str,
+    model: str | None,
+    provider: str | None = None,
+) -> bool:
+    """Trigger probe for `pi`.
+
+    pi exposes a candidate skill through `--skill <dir>`, so the description
+    under test is written to a throwaway skill directory instead of into a
+    Claude command file.  `--no-skills` turns off discovery, which keeps the
+    probe honest: only the candidate skill can be consulted.
+
+    Triggering is observed rather than inferred: with `--mode json` pi emits a
+    `tool_execution_start` event for every tool call, and consulting a skill
+    means reading its SKILL.md.  A query that never reads that file did not
+    trigger, no matter what the final answer says.
+    """
+    skill_dir = Path(project_root) / clean_name
+    skill_file = skill_dir / "SKILL.md"
+    indented_desc = "\n  ".join(skill_description.split("\n"))
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_file.write_text(
+        f"---\n"
+        f"name: {clean_name}\n"
+        f"description: >-\n"
+        f"  {indented_desc}\n"
+        f"---\n\n"
+        f"# {skill_name}\n\n"
+        f"This skill handles: {skill_description}\n"
+    )
+
+    cmd = [
+        "pi",
+        "--print",
+        "--no-session",
+        "--no-skills",
+        "--mode", "json",
+        "--skill", str(skill_dir),
+    ]
+    cmd.extend(pi_launch_args(provider, model))
+    cmd.append(query)
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        cwd=project_root,
+        env={k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
+    )
+
+    triggered = False
+    start_time = time.time()
+    buffer = ""
+    try:
+        while time.time() - start_time < timeout:
+            if process.poll() is not None:
+                remaining = process.stdout.read()
+                if remaining:
+                    buffer += remaining.decode("utf-8", errors="replace")
+                break
+
+            ready, _, _ = select.select([process.stdout], [], [], 1.0)
+            if not ready:
+                continue
+
+            chunk = os.read(process.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            buffer += chunk.decode("utf-8", errors="replace")
+
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "tool_execution_start":
+                    continue
+                args = event.get("args") or {}
+                target = args.get("path") or args.get("file_path") or ""
+                if isinstance(target, str) and clean_name in target:
+                    return True
+                # Any other tool call is fine; keep watching for the skill read.
+
+        if buffer.strip():
+            for line in buffer.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "tool_execution_start":
+                    continue
+                args = event.get("args") or {}
+                target = args.get("path") or args.get("file_path") or ""
+                if isinstance(target, str) and clean_name in target:
+                    triggered = True
+                    break
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        if skill_file.exists():
+            skill_file.unlink()
+        if skill_dir.exists():
+            try:
+                skill_dir.rmdir()
+            except OSError:
+                pass
+
+    return triggered
 
 
 def run_single_query(
@@ -39,17 +167,28 @@ def run_single_query(
     timeout: int,
     project_root: str,
     model: str | None = None,
+    provider: str | None = None,
 ) -> bool:
     """Run a single query and return whether the skill was triggered.
 
-    Creates a command file in .claude/commands/ so it appears in Claude's
-    available_skills list, then runs `claude -p` with the raw query.
+    Claude path: creates a command file in .claude/commands/ so it appears in
+    Claude's available_skills list, then runs `claude -p` with the raw query.
     Uses --include-partial-messages to detect triggering early from
     stream events (content_block_start) rather than waiting for the
     full assistant message, which only arrives after tool execution.
+
+    pi path: writes the candidate skill to a scratch directory and watches
+    pi's JSON event stream for a tool call that reads it.
     """
     unique_id = uuid.uuid4().hex[:8]
     clean_name = f"{skill_name}-skill-{unique_id}"
+
+    if active_cli() != "claude":
+        return _run_single_query_pi(
+            query, clean_name, skill_name, skill_description,
+            timeout, project_root, model, provider,
+        )
+
     project_commands_dir = Path(project_root) / ".claude" / "commands"
     command_file = project_commands_dir / f"{clean_name}.md"
 
@@ -191,6 +330,7 @@ def run_eval(
     runs_per_query: int = 1,
     trigger_threshold: float = 0.5,
     model: str | None = None,
+    provider: str | None = None,
 ) -> dict:
     """Run the full eval set and return results."""
     results = []
@@ -207,6 +347,7 @@ def run_eval(
                     timeout,
                     str(project_root),
                     model,
+                    provider,
                 )
                 future_to_info[future] = (item, run_idx)
 
@@ -262,10 +403,11 @@ def main():
     parser.add_argument("--skill-path", required=True, help="Path to skill directory")
     parser.add_argument("--description", default=None, help="Override description to test")
     parser.add_argument("--num-workers", type=int, default=10, help="Number of parallel workers")
-    parser.add_argument("--timeout", type=int, default=30, help="Timeout per query in seconds")
+    parser.add_argument("--timeout", type=int, default=180, help="Timeout per query in seconds (pi runs take tens of seconds)")
     parser.add_argument("--runs-per-query", type=int, default=3, help="Number of runs per query")
     parser.add_argument("--trigger-threshold", type=float, default=0.5, help="Trigger rate threshold")
-    parser.add_argument("--model", default=None, help="Model to use for claude -p (default: user's configured model)")
+    parser.add_argument("--model", default=None, help="Model to use (pi or claude, depending on SKILL_CREATOR_CLI)")
+    parser.add_argument("--provider", default=None, help="Provider for pi (default: $PI_PROVIDER or opencode-go)")
     parser.add_argument("--verbose", action="store_true", help="Print progress to stderr")
     args = parser.parse_args()
 
@@ -293,6 +435,7 @@ def main():
         runs_per_query=args.runs_per_query,
         trigger_threshold=args.trigger_threshold,
         model=args.model,
+        provider=args.provider,
     )
 
     if args.verbose:

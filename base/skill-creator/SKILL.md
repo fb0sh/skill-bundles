@@ -387,7 +387,7 @@ python -m scripts.run_loop \
   --verbose
 ```
 
-Use the model ID from your system prompt (the one powering the current session) so the triggering test matches what the user actually experiences.
+Use the model ID from your system prompt (the one powering the current session) so the triggering test matches what the user actually experiences. With `pi` also set the provider (flag or `PI_PROVIDER`, default `opencode-go`), and expect each query to take tens of seconds — the defaults are `--timeout 180 --num-workers 4` for that reason.
 
 While it runs, periodically tail the output to give the user updates on which iteration it's on and what the scores look like.
 
@@ -429,7 +429,11 @@ In Claude.ai, the core workflow is the same (draft → test → review → impro
 
 **The iteration loop**: Same as before — improve the skill, rerun the test cases, ask for feedback — just without the browser reviewer in the middle. You can still organize results into iteration directories on the filesystem if you have one.
 
-**Description optimization**: This section requires the `claude` CLI tool (specifically `claude -p`) which is only available in Claude Code. Skip it if you're on Claude.ai.
+**Description optimization**: This section shells out to an LLM CLI. It defaults
+to `pi` and falls back to `claude -p` when `SKILL_CREATOR_CLI=claude`; see
+`scripts/llm_cli.py`. Pass `--model` (and `PI_PROVIDER`, default
+`opencode-go`) so the trigger test runs on the model the user actually uses.
+Skip it only if neither CLI is installed.
 
 **Blind comparison**: Requires subagents. Skip it.
 
@@ -451,7 +455,7 @@ If you're in Cowork, the main things to know are:
 - For whatever reason, the Cowork setup seems to disincline Claude from generating the eval viewer after running the tests, so just to reiterate: whether you're in Cowork or in Claude Code, after running tests, you should always generate the eval viewer for the human to look at examples before revising the skill yourself and trying to make corrections, using `generate_review.py` (not writing your own boutique html code). Sorry in advance but I'm gonna go all caps here: GENERATE THE EVAL VIEWER *BEFORE* evaluating inputs yourself. You want to get them in front of the human ASAP!
 - Feedback works differently: since there's no running server, the viewer's "Submit All Reviews" button will download `feedback.json` as a file. You can then read it from there (you may have to request access first).
 - Packaging works — `package_skill.py` just needs Python and a filesystem.
-- Description optimization (`run_loop.py` / `run_eval.py`) should work in Cowork just fine since it uses `claude -p` via subprocess, not a browser, but please save it until you've fully finished making the skill and the user agrees it's in good shape.
+- Description optimization (`run_loop.py` / `run_eval.py`) should work in Cowork just fine since it shells out to an LLM CLI (`pi` by default, `claude -p` when `SKILL_CREATOR_CLI=claude`) rather than a browser, but please save it until you've fully finished making the skill and the user agrees it's in good shape.
 - **Updating an existing skill**: The user might be asking you to update an existing skill, not create a new one. Follow the update guidance in the claude.ai section above.
 
 ---
