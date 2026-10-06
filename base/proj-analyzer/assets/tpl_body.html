@@ -1,0 +1,977 @@
+<script id="report-data" type="application/json">__DATA_JSON__</script>
+<script>
+"use strict";
+const DATA = JSON.parse(document.getElementById("report-data").textContent);
+const $ = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.prototype.slice.call((r || document).querySelectorAll(s));
+
+/* Findings files are sometimes a bare array (e.g. endpoints.json) and sometimes an
+   object wrapping the list (e.g. flows.json -> {summary, flows:[...]}). Accept both
+   so a hand-written findings file never silently blanks a whole section. */
+function arr(v,key){ if(Array.isArray(v)) return v; return (v&&key&&Array.isArray(v[key]))?v[key]:[]; }
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function tid(s){return String(s==null?"":s).replace(/[^a-zA-Z0-9_]/g,"");}
+function slugify(s){return String(s==null?"":s).toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]+/g,"-").replace(/^-|-$/g,"");}
+function src(path,line){
+  if(!path) return '<span class="dim">—</span>';
+  const label = line ? path+":"+line : path;
+  return '<span class="src" data-copy="'+esc(label)+'" title="点击复制 '+esc(label)+'">'+esc(label)+'</span>';
+}
+function badge(cls,txt){return '<span class="b '+cls+'">'+esc(txt)+'</span>';}
+function mbadge(m){return badge(String(m||"").toLowerCase(),m);}
+const AUTH_LABEL={public:"无需认证",user:"玩家 JWT","super-admin":"超管 JWT","internal-token":"内部服务令牌","query-ticket":"一次性 ticket"};
+const AUTH_CLS={public:"n",user:"info","super-admin":"violet","internal-token":"warn","query-ticket":"acc"};
+function authLabel(a){return AUTH_LABEL[a]||a;}
+function authBadge(a){return badge(AUTH_CLS[a]||"n",a);}
+function sevCls(s){return s==="高"||s==="high"?"danger":(s==="中"||s==="medium"?"warn":"n");}
+function tbl(headers,rows,cls,rowAttrs){
+  return '<div class="tblwrap"><table'+(cls?' class="'+cls+'"':'')+'><thead><tr>'+
+    headers.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>'+
+    rows.map((r,i)=>'<tr '+((rowAttrs&&rowAttrs[i])||'')+'>'+r.map(c=>'<td>'+c+'</td>').join('')+'</tr>').join('')+
+    '</tbody></table></div>';
+}
+function kv(k,v){return '<div class="k">'+k+'</div><div class="v">'+v+'</div>';}
+function qs(v){return esc(v==null?"—":v);}
+/* Prose fields may carry light markup (bold, inline code). They may ALSO contain
+   angle brackets that are not markup at all — generic types like `web::Data<AppState>`,
+   redacted placeholders like `<user>`, comparison operators. Rendering those raw makes
+   the browser swallow them as unknown tags and the text silently disappears.
+   rich() passes a small allowlist of real tags through and escapes everything else. */
+const RICH_TAGS=/^(\/?)(b|i|em|strong|code|span|small|br|ul|ol|li|p|div|a)\b/i;
+function rich(v){
+  if(v==null) return "";
+  return String(v).replace(/<([^<>]*)>/g,(m,inner)=>RICH_TAGS.test(inner)?m:"&lt;"+inner+"&gt;");
+}
+/* Generation tooling is usually written as {entities, tsTypes, cli, ...}; a labelled
+   [{label,value}] array is also accepted. Common keys get a readable label rather
+   than raw camelCase. */
+const LOADER_LABELS={how:"加载方式",pathResolution:"路径解析",onlyEnvVar:"环境变量",
+                     secrets:"敏感值处理",reload:"热重载",defaults:"默认值",sources:"来源"};
+const STACK_LABELS={framework:"框架",version:"版本",router:"路由",routerVersion:"路由版本",
+                    ui:"UI",uiVersion:"UI 版本",state:"状态",dataFetching:"数据获取",
+                    build:"构建",test:"测试",lint:"Lint",language:"语言",
+                    packageManager:"包管理",devServerPort:"开发端口",apiBaseUrl:"API 基址",
+                    proxy:"代理",envVars:"环境变量",pathAliases:"路径别名"};
+const GEN_LABELS={entities:"实体",tsTypes:"TS 类型",cli:"CLI",cliVersion:"CLI 版本",
+                  source:"来源",models:"模型",types:"类型",enums:"枚举",schema:"Schema"};
+function genRows(g){
+  if(Array.isArray(g)) return g.map(x=>'<li>'+esc(x.label)+'：<span class="mono">'+esc(x.value)+'</span></li>').join('');
+  return Object.keys(g).map(k=>'<li>'+esc(GEN_LABELS[k]||k)+'：<span class="mono">'+
+    esc(typeof g[k]==="string"?g[k]:JSON.stringify(g[k]))+'</span></li>').join('');
+}
+function searchEscape(s){return String(s).replace(/[.*+?^${}()|[\]\\]/g,"\\$&");}
+function hl(text,terms){
+  let out=esc(text);
+  terms.forEach(t=>{ if(!t) return;
+    try{ out=out.replace(new RegExp("("+searchEscape(t)+")","gi"),"<mark>$1</mark>"); }catch(e){}
+  });
+  return out;
+}
+function fuzzy(hay,needle){
+  hay=String(hay||"").toLowerCase(); needle=String(needle||"").toLowerCase().trim();
+  if(!needle) return 0;
+  const i=hay.indexOf(needle);
+  if(i>=0) return 1000-i;
+  let hi=0,score=0;
+  for(const ch of needle){ const j=hay.indexOf(ch,hi); if(j<0) return -1; score+=10-(j-hi); hi=j+1; }
+  return score;
+}
+
+/* ── navigation ───────────────────────────────────────── */
+const SECTIONS=[
+  {id:"overview",label:"Overview",icon:"▦",group:"开始",has:d=>!!d.meta},
+  {id:"architecture",label:"Architecture",icon:"▤",group:"开始",has:d=>!!d.architecture},
+  {id:"files",label:"File Tree",icon:"▸",group:"开始",has:d=>!!d.tree},
+  {id:"modules",label:"Modules",icon:"▣",group:"代码",has:d=>arr(d.modules,"modules").length},
+  {id:"api",label:"API Endpoints",icon:"⇄",group:"代码",has:d=>arr(d.endpoints,"endpoints").length},
+  {id:"flows",label:"Request Flows",icon:"⇉",group:"代码",has:d=>arr(d.flows,"flows").length},
+  {id:"database",label:"Database",icon:"▥",group:"数据与配置",has:d=>arr(d.database,"tables").length},
+  {id:"config",label:"Configuration",icon:"⚙",group:"数据与配置",has:d=>arr(d.config,"items").length},
+  {id:"auth",label:"Authentication",icon:"⚿",group:"数据与配置",has:d=>!!d.auth},
+  {id:"frontend",label:"Frontend",icon:"◧",group:"客户端",has:d=>arr(d.frontend,"pages").length},
+  {id:"jobs",label:"Background Jobs",icon:"◔",group:"运行时",has:d=>arr(d.jobs,"tasks").length},
+  {id:"deps",label:"Dependencies",icon:"◈",group:"运行时",has:d=>arr(d.deps,"groups").length},
+  {id:"deploy",label:"Build & Deploy",icon:"⬒",group:"运行时",has:d=>!!d.deploy},
+  {id:"entry",label:"Important Files",icon:"★",group:"接手",has:d=>arr(d.entry,"order").length},
+  {id:"risks",label:"Risks / Notes",icon:"⚠",group:"接手",has:d=>arr(d.risks,"risks").length}
+];
+const PAGES=SECTIONS.filter(s=>s.has(DATA));
+const RENDER={};
+
+/* ── Overview ─────────────────────────────────────────── */
+RENDER.overview=function(){
+  const o=DATA.overview||{}; const m=DATA.meta||{};
+  let h='<h1>'+esc(m.name||"Project Analysis")+'</h1>';
+  if(m.tagline) h+='<p class="lead">'+esc(m.tagline)+'</p>';
+  if(o.stats&&o.stats.length){
+    h+='<div class="grid g4">'+o.stats.map(s=>
+      '<div class="stat"><div class="v">'+esc(s.value)+'</div><div class="l">'+esc(s.label)+'</div>'+
+      (s.src?'<div class="x">'+esc(s.src)+'</div>':'')+'</div>').join('')+'</div>';
+  }
+  h+='<h2 id="ov-project">项目定位</h2><div class="grid g2">';
+  h+='<div class="card">'+(o.oneLiner?'<h4>一句话</h4><p>'+esc(o.oneLiner)+'</p>':'')+
+     (o.type?'<h4>项目类型</h4><p>'+esc(o.type)+'</p>':'')+
+     (o.shape?'<h4>形态</h4><p>'+esc(o.shape)+'</p>':'')+
+     (o.repoState?'<h4>仓库状态</h4><p class="mono small">'+esc(o.repoState)+'</p>':'')+'</div>';
+  h+='<div class="card">'+(o.stack&&o.stack.length?'<h4>技术栈</h4><div class="row">'+o.stack.map(t=>badge("acc",t)).join(" ")+'</div>':'')+
+     (o.archPoints&&o.archPoints.length?'<h4 style="margin-top:12px">架构要点</h4><ul class="tight small">'+o.archPoints.map(p=>'<li>'+p+'</li>').join('')+'</ul>':'')+'</div>';
+  h+='</div>';
+  const map=DATA.architecture?(DATA.architecture.diagram||DATA.architecture.systemMap):"";
+  if(map) h+='<h2 id="ov-map">System Map</h2>'+map;
+  if(o.keyEntries&&o.keyEntries.length){
+    h+='<h2 id="ov-entry">关键入口（先读这些）</h2>'+tbl(["文件","职责","为什么先读"],
+      o.keyEntries.map(e=>[src(e.path,e.line),esc(e.role),esc(e.why)]));
+  }
+  if(o.surface&&o.surface.length){
+    h+='<h2 id="ov-counts">Enumerated Surface</h2>'+tbl(["面","数量","备注"],
+      o.surface.map(s=>[esc(s.area),'<span class="num">'+esc(s.count)+'</span>',esc(s.note)]));
+  }
+  if(o.caveats&&o.caveats.length){
+    h+='<h2 id="ov-caveat">阅读本报告的注意事项</h2><div class="note warn"><ul class="tight">'+
+       o.caveats.map(c=>'<li>'+rich(c)+'</li>').join('')+'</ul></div>';
+  }
+  return h;
+};
+
+/* ── Architecture ─────────────────────────────────────── */
+function layersDiagram(layers){
+  return '<div class="diagram"><div class="lay">'+layers.map((l,i)=>
+      (i?'<div class="arw">▼</div>':'')+
+      '<div class="laygroup" style="width:100%;max-width:900px"><div class="lbl">'+esc(l.name)+'</div>'+
+      '<div class="box acc" style="min-width:260px"><div class="t">'+esc(l.path||l.name)+'</div>'+
+      '<div class="s">'+esc((l.types||"").slice(0,120))+'</div></div>'+
+      '<p class="small dim" style="text-align:center;margin:7px 0 0">'+esc(l.role)+'</p></div>').join('')+
+    '</div></div>';
+}
+function moduleGraph(modules){
+  return '<div class="tblwrap"><table><thead><tr><th>模块</th><th>依赖（上游）</th><th>被依赖（下游）</th></tr></thead><tbody>'+
+    modules.map(m=>'<tr><td><b>'+esc(m.name)+'</b><div class="tiny dim mono">'+esc(m.path||"")+'</div></td>'+
+      '<td>'+((m.upstream||[]).map(u=>badge("n",u)).join(" ")||'<span class="dim">—</span>')+'</td>'+
+      '<td>'+((m.downstream||[]).map(d=>badge("info",d)).join(" ")||'<span class="dim">—</span>')+'</td></tr>').join('')+
+    '</tbody></table></div>';
+}
+RENDER.architecture=function(){
+  const a=DATA.architecture||{};
+  let h='<h1>Architecture</h1>'+(a.summary?'<p class="lead">'+rich(a.summary)+'</p>':'');
+  h+='<h2 id="arch-system">系统分层与边界</h2>'+(a.diagram||(a.layers&&a.layers.length?layersDiagram(a.layers):'<p class="dim">未提供</p>'));
+  if(a.layers&&a.layers.length){
+    h+='<h2 id="arch-layers">各层职责</h2>'+tbl(["层","路径","职责","关键类型"],
+      a.layers.map(l=>['<b>'+esc(l.name)+'</b>',src(l.path),esc(l.role),'<span class="mono small">'+esc(l.types||"")+'</span>']));
+  }
+  if(a.modules&&a.modules.length){
+    h+='<h2 id="arch-modules">模块依赖（实际调用方向）</h2>'+moduleGraph(a.modules);
+  }
+  if(a.engines&&a.engines.length){
+    h+='<h2 id="arch-engines">核心变体 / 引擎的差异</h2>'+tbl(["变体","模式","数据模型","核心流程","关键文件"],
+      a.engines.map(e=>['<b>'+esc(e.engine)+'</b>',esc(e.mode),esc(e.model),esc(e.flow),
+        '<span class="mono small">'+(e.files||[]).map(f=>src(f)).join('<br>')+'</span>']));
+  }
+  if(a.decisions&&a.decisions.length){
+    h+='<h2 id="arch-decisions">值得注意的架构决策</h2><div class="grid g2">'+
+       a.decisions.map(d=>'<div class="card tight"><h4>'+esc(d.title)+'</h4><p class="small">'+rich(d.text)+'</p>'+
+         (d.src?'<div class="small">'+src(d.src,d.line)+'</div>':'')+'</div>').join('')+'</div>';
+  }
+  return h;
+};
+
+/* ── File Tree ────────────────────────────────────────── */
+function treeNode(n){
+  const isDir=n.type==="dir";
+  const core=n.core?'<span class="tag core">核心</span>':'';
+  const gen=n.generated?'<span class="tag gen">生成</span>':'';
+  if(isDir){
+    const hasKids=n.children&&n.children.length;
+    return '<div class="ftdir" data-path="'+esc(n.path)+'">'+
+      '<span class="ftn dirname" id="dir-'+slugify(n.path)+'" data-path="'+esc(n.path)+'" data-kind="dir">'+
+        (hasKids?'<span class="caret">▾</span>':'<span class="caret"> </span>')+esc(n.name)+'/'+core+'</span>'+
+      (hasKids?'<div class="ftkids" data-open="1">'+n.children.map(treeNode).join('')+'</div>':'')+
+    '</div>';
+  }
+  return '<div><span class="ftn fname" id="file-'+slugify(n.path)+'" data-path="'+esc(n.path)+'" data-kind="file">'+
+    '<span class="caret"> </span>'+esc(n.name)+core+gen+
+    (n.lines?'<span class="dim tiny"> '+n.lines+'L</span>':'')+'</span></div>';
+}
+RENDER.files=function(){
+  const t=DATA.tree;
+  let h='<h1>File Tree</h1><p class="lead">已排除依赖 / 构建产物 / 缓存目录；'+
+    '<span class="tag core">核心</span> 是理解项目必读项，<span class="tag gen">生成</span> 是不可手改的产物。点击文件查看详情。</p>';
+  h+='<div class="filters"><input type="search" id="ftsearch" placeholder="过滤路径（如 bootstrap、src/api、migration）…">'+
+     '<button class="topbtn" id="ftcollapse">全部收起</button>'+
+     '<button class="topbtn" id="ftexpand">展开到深度 2</button>'+
+     '<span class="count" id="ftcount">'+esc(DATA.stats&&DATA.stats.treeCount||"")+'</span></div>';
+  h+='<div class="flex2"><div class="card" id="filetree">'+treeNode(t)+'</div>'+
+     '<div id="filedetail"><div class="card"><p class="dim small">从左侧选择一个文件或目录查看用途、依赖与关联。</p></div></div></div>';
+  return h;
+};
+function bindFiles(){
+  const root=$("#filetree"); if(!root) return;
+  root.addEventListener("click",ev=>{
+    const n=ev.target.closest(".ftn"); if(!n) return;
+    const p=n.dataset.path, kind=n.dataset.kind;
+    if(kind==="dir"){
+      const box=n.parentElement.querySelector(".ftkids");
+      if(box){ box.classList.toggle("hidden");
+        n.querySelector(".caret").textContent=box.classList.contains("hidden")?"▸":"▾"; }
+    }
+    $$(".ftn.sel",root).forEach(x=>x.classList.remove("sel"));
+    n.classList.add("sel");
+    showFileDetail(p,kind);
+    ev.stopPropagation();
+  });
+  const search=$("#ftsearch");
+  if(search) search.addEventListener("input",()=>paintTree(search.value.trim().toLowerCase()));
+  const col=$("#ftcollapse"); if(col) col.addEventListener("click",()=>{
+    $$(".ftkids",root).forEach(k=>k.classList.add("hidden"));
+    $$(".ftn.dirname .caret",root).forEach(c=>c.textContent="▸"); });
+  const exp=$("#ftexpand"); if(exp) exp.addEventListener("click",()=>{
+    paintTree("");
+    $$(".ftdir",root).forEach(d=>{
+      const lvl=d.dataset.path.split("/").length, k=d.querySelector(":scope > .ftkids");
+      if(k){ const open=lvl<=2; k.classList.toggle("hidden",!open);
+        const c=d.querySelector(":scope > .ftn .caret"); if(c) c.textContent=open?"▾":"▸"; }
+    });
+  });
+}
+function paintTree(q){
+  const root=$("#filetree"); if(!root) return;
+  const walk=el=>{
+    $$(":scope > .ftdir",el).forEach(d=>{
+      walk(d);
+      const hit=q===""?true:(d.dataset.path||"").toLowerCase().includes(q)||
+        $$(".ftn",d).some(x=>(x.dataset.path||"").toLowerCase().includes(q));
+      d.style.display=hit?"":"none";
+      const kids=d.querySelector(":scope > .ftkids");
+      if(kids&&q){ const sub=$$(".ftn",d).some(x=>(x.dataset.path||"").toLowerCase().includes(q));
+        kids.classList.toggle("hidden",!sub);
+        const c=d.querySelector(":scope > .ftn .caret"); if(c) c.textContent=sub?"▾":"▸"; }
+    });
+    $$(":scope > div > .ftn.fname",el).forEach(f=>{
+      f.parentElement.style.display=(q===""||(f.dataset.path||"").toLowerCase().includes(q))?"":"none"; });
+  };
+  walk(root);
+}
+function findNode(n,path){
+  if(n.path===path) return n;
+  for(const c of (n.children||[])){ const r=findNode(c,path); if(r) return r; }
+  return null;
+}
+function showFileDetail(path,kind){
+  const box=$("#filedetail"); if(!box) return;
+  const n=findNode(DATA.tree,path);
+  if(!n){ box.innerHTML='<div class="card"><p class="dim">无详情</p></div>'; return; }
+  const note=(DATA.fileNotes||{})[path]||{};
+  let h='<div class="card"><h3 style="margin-top:0" class="mono">'+esc(n.name)+(kind==="dir"?"/":"")+'</h3>'+
+    '<div class="small dim mono" style="word-break:break-all">'+esc(path)+'</div>';
+  if(n.lines) h+='<p class="small dim">'+n.lines+' 行</p>';
+  if(n.role) h+='<h4>用途</h4><p class="small">'+esc(n.role)+'</p>';
+  if(note.module) h+='<h4>所属模块</h4><p class="small mono">'+esc(note.module)+'</p>';
+  if(n.core) h+='<p>'+badge("acc","核心文件")+'</p>';
+  if(n.generated) h+='<p>'+badge("n","生成产物 — 不要手改")+'</p>';
+  ["exports|重要导出","deps|依赖","usedBy|被谁使用","api|关联 API"].forEach(spec=>{
+    const [k,label]=spec.split("|");
+    if(note[k]&&note[k].length) h+='<h4>'+label+'</h4><ul class="tight small mono">'+note[k].map(e=>'<li>'+esc(e)+'</li>').join('')+'</ul>';
+  });
+  if(note.note) h+='<h4>备注</h4><p class="small">'+esc(note.note)+'</p>';
+  if(!n.role&&!note.role) h+='<p class="small dim">该路径未登记注解 —— 其具体职责<b>未确认</b>。</p>';
+  if(kind==="dir"&&n.children){
+    h+='<h4>直接子项 ('+n.children.length+')</h4><ul class="tight small mono" style="max-height:220px;overflow:auto">'+
+      n.children.slice(0,60).map(c=>'<li>'+esc(c.name)+(c.type==="dir"?"/":"")+'</li>').join('')+'</ul>';
+  }
+  box.innerHTML=h+'</div>';
+}
+
+/* ── Modules ──────────────────────────────────────────── */
+RENDER.modules=function(){
+  const m=DATA.modules||{}; const list=m.modules||[];
+  let h='<h1>Core Modules</h1>'+(m.summary?'<p class="lead">'+rich(m.summary)+'</p>':'');
+  h+='<div class="filters"><input type="search" id="modsearch" placeholder="过滤模块 / 符号 / 文件…">'+
+     '<span class="count" id="modcount">'+list.length+' modules</span></div><div id="modlist">';
+  list.forEach(mod=>{
+    h+='<div class="card modcard" id="module-'+slugify(mod.name)+'" data-text="'+
+      esc((mod.name+" "+(mod.path||"")+" "+(mod.keyFiles||[]).map(f=>f.path).join(" ")+" "+
+           (mod.keySymbols||[]).map(s=>s.name).join(" ")).toLowerCase())+'">'+
+      '<div class="spread"><h3 style="margin:0">'+esc(mod.name)+'</h3><span class="mono small dim">'+esc(mod.path||"")+'</span></div>'+
+      '<p class="small" style="margin-top:5px">'+esc(mod.responsibility||"")+'</p>';
+    if(mod.entry) h+='<p class="small">入口：'+src(mod.entry)+'</p>';
+    h+='<div class="grid g2" style="margin-top:8px">';
+    if((mod.keyFiles||[]).length) h+='<div><h4>入口 / 核心文件</h4><ul class="tight small">'+
+      mod.keyFiles.map(f=>'<li>'+src(f.path)+' — '+esc(f.role||"")+'</li>').join('')+'</ul></div>';
+    if((mod.keySymbols||[]).length) h+='<div><h4>核心符号</h4><ul class="tight small">'+
+      mod.keySymbols.map(s=>'<li><span class="mono">'+esc(s.name)+'</span> <span class="dim tiny">'+esc(s.kind||"")+'</span> — '+esc(s.role||"")+'</li>').join('')+'</ul></div>';
+    h+='</div><div class="grid g2" style="margin-top:6px">'+
+      '<div><h4>上游依赖</h4><div class="row small">'+((mod.upstream||[]).map(x=>badge("n",x)).join(" ")||'<span class="dim">—</span>')+'</div></div>'+
+      '<div><h4>被调用方</h4><div class="row small">'+((mod.downstream||[]).map(x=>badge("info",x)).join(" ")||'<span class="dim">—</span>')+'</div></div></div>';
+    if((mod.routes||[]).length) h+='<h4>HTTP 面</h4><div class="row small mono">'+mod.routes.map(r=>'<span class="b n">'+esc(r)+'</span>').join(" ")+'</div>';
+    if(mod.lifecycle) h+='<h4>生命周期</h4><p class="small">'+esc(mod.lifecycle)+'</p>';
+    if(mod.notes) h+='<p class="small" style="margin-top:7px"><b>备注：</b>'+esc(mod.notes)+'</p>';
+    h+='</div>';
+  });
+  h+='</div>';
+  if((m.largestFiles||[]).length){
+    h+='<h2 id="mod-large">超大文件（接手风险）</h2>'+tbl(["文件","行数","说明","风险"],
+      m.largestFiles.map(f=>[src(f.path),'<span class="num">'+esc(f.lines)+'</span>',esc(f.why||""),esc(f.risk||"")]));
+  }
+  if((m.coupling||[]).length){
+    h+='<h2 id="mod-coupling">耦合点</h2>'+tbl(["模块","耦合对象","类型","证据","影响"],
+      m.coupling.map(c=>['<b>'+esc(c.module)+'</b>',esc(c.coupledWith),
+        badge(c.kind==="god"?"danger":(c.kind==="circular"?"warn":"n"),c.kind||""),
+        c.evidence?src(String(c.evidence).split(":")[0],String(c.evidence).split(":")[1]):"—",
+        esc(c.impact||"")]));
+  }
+  if(m.conventions){
+    h+='<h2 id="mod-conv">跨模块约定</h2><div class="grid g2">'+
+      Object.keys(m.conventions).filter(k=>typeof m.conventions[k]!=="string"||m.conventions[k]).map(k=>{
+        const v=m.conventions[k];
+        const body=typeof v==="string"?esc(v):('<ul class="tight small">'+Object.keys(v).map(kk=>
+          '<li><b class="mono">'+esc(kk)+'</b>：'+esc(typeof v[kk]==="string"?v[kk]:JSON.stringify(v[kk]))+'</li>').join('')+'</ul>');
+        return '<div class="card tight"><h4>'+esc(k)+'</h4>'+body+'</div>';
+      }).join('')+'</div>';
+  }
+  if((m.quirks||[]).length){
+    h+='<h2 id="mod-quirks">模块层注意点</h2><ul class="tight small">'+m.quirks.map(q=>'<li>'+q+'</li>').join('')+'</ul>';
+  }
+  if((m.notes||[]).length){
+    h+='<div class="note warn"><b>未确认 / 待核：</b><ul class="tight small">'+m.notes.map(n=>'<li>'+esc(n)+'</li>').join('')+'</ul></div>';
+  }
+  return h;
+};
+function bindModules(){
+  const inp=$("#modsearch"); if(!inp) return;
+  inp.addEventListener("input",()=>{ const q=inp.value.trim().toLowerCase();
+    $$(".modcard").forEach(c=>{ c.style.display=(!q||c.dataset.text.includes(q))?"":"none"; }); });
+}
+
+/* ── API explorer (prefix tree + flat list) ───────────── */
+function epRow(e,compact){
+  const tail=e.path.split("/").filter(Boolean).pop()||e.path;
+  const label=compact?("/"+tail):e.path;
+  const also=(e.alsoAt&&e.alsoAt.length)?' <span class="b warn" title="同一 handler 在多个前缀下注册">多路径注册</span>':'';
+  return '<div class="ep'+(compact?" leaf":"")+'" id="api-'+esc(e.id)+'" data-m="'+esc(e.method)+'" data-mod="'+esc(e.module||"")+'"'+
+    ' data-auth="'+esc(e.auth)+'" data-path="'+esc(e.path)+'"'+
+    ' data-text="'+esc((e.path+" "+e.handler+" "+e.file+" "+(e.module||"")).toLowerCase())+'">'+
+    '<div class="hd"><span class="b '+esc(String(e.method).toLowerCase())+'">'+esc(e.method)+'</span>'+
+      '<span class="p">'+esc(label)+'</span>'+
+      (compact?'':'<span class="h">'+esc(e.handler)+'()</span>')+also+
+      '<span style="margin-left:auto" class="row">'+badge("n",e.module||"")+' '+authBadge(e.auth)+'</span></div>'+
+    '<div class="bd"><div class="kv">'+
+      kv("Handler",'<span class="mono">'+esc(e.handler)+'()</span>')+
+      kv("全路径",'<span class="mono">'+esc(e.method)+' '+esc(e.path)+'</span>')+
+      kv("源码",src(e.file,e.line))+
+      kv("模块",esc(e.module||"—"))+
+      kv("认证",authBadge(e.auth)+' '+esc(authLabel(e.auth)))+
+      kv("说明",qs(e.summary||e.note))+
+      (e.chain?kv("挂载链",'<span class="mono small">'+esc(e.chain)+'</span>'):"")+
+      (e.middleware?kv("中间件",'<span class="mono small">'+esc(e.middleware)+'</span>'):"")+
+      (e.alsoAt&&e.alsoAt.length?kv("同 handler 其它路径",'<span class="mono small">'+e.alsoAt.map(esc).join('<br>')+'</span>'):"")+
+      (e.mounts&&e.mounts.length?kv("挂载点",'<span class="mono small">'+e.mounts.map(esc).join(" · ")+'</span>'):"")+
+    '</div></div></div>';
+}
+function apiTree(eps){
+  const root={seg:"",path:"",kids:{},order:[],eps:[]};
+  eps.forEach(e=>{
+    const segs=e.path.split("/").filter(Boolean);
+    let n=root;
+    segs.forEach((sg,i)=>{
+      if(!n.kids[sg]){ n.kids[sg]={seg:sg,path:"/"+segs.slice(0,i+1).join("/"),kids:{},order:[],eps:[]}; n.order.push(sg); }
+      n=n.kids[sg];
+    });
+    n.eps.push(e);
+  });
+  return root;
+}
+function apiCount(n){ let c=n.eps.length; n.order.forEach(sg=>{ c+=apiCount(n.kids[sg]); }); return c; }
+function apiTreeHtml(node,depth){
+  let h="";
+  node.order.forEach(sg=>{
+    const k=node.kids[sg], hasKids=k.order.length>0, open=depth<2;
+    const methods=[...new Set(k.eps.map(e=>e.method))];
+    h+='<div class="epdir" data-path="'+esc(k.path)+'" data-depth="'+depth+'">'+
+       '<div class="ephd"><span class="caret">'+(hasKids?(open?"▾":"▸"):" ")+'</span>'+
+         '<span class="seg">'+esc(k.seg)+'</span>'+
+         '<span class="cnt">'+apiCount(k)+'</span>'+
+         (methods.length?'<span class="ms">'+methods.map(m=>'<span class="b '+m.toLowerCase()+'">'+m+'</span>').join("")+'</span>'
+                        :'<span class="ms dim tiny">path 本身无端点</span>')+
+       '</div><div class="epkids'+(open?"":" hidden")+'">'+
+         k.eps.slice().sort((a,b)=>a.method<b.method?-1:1).map(e=>epRow(e,true)).join("")+
+         apiTreeHtml(k,depth+1)+'</div></div>';
+  });
+  return h;
+}
+RENDER.api=function(){
+  const eps=arr(DATA.endpoints,"endpoints");
+  const mods=[...new Set(eps.map(e=>e.module))].filter(Boolean).sort();
+  const auths=[...new Set(eps.map(e=>e.auth))].sort();
+  let h='<h1>API Endpoints</h1><p class="lead">共 <b>'+eps.length+'</b> 个端点，由源码路由定义 + <span class="mono">scope()</span> 前缀链<b>机械提取</b>。'+
+    '前缀树视图按 URL 段聚合，适合摸清 API 形状；列表视图适合逐条查。点击任一端点展开源码与认证。</p>';
+  h+='<div class="filters">'+
+     '<div class="vtabs"><button data-view="tree" class="on">▸ 前缀树</button><button data-view="list">≡ 列表</button></div>'+
+     '<input type="search" id="epq" placeholder="搜索 path / handler / 文件…">'+
+     '<select id="epm"><option value="">Method: 全部</option>'+["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"]
+        .filter(m=>eps.some(e=>e.method===m)).map(m=>'<option>'+m+'</option>').join('')+'</select>'+
+     '<select id="epmod"><option value="">Module: 全部</option>'+mods.map(m=>'<option>'+esc(m)+'</option>').join('')+'</select>'+
+     '<select id="epa"><option value="">Auth: 全部</option>'+auths.map(a=>'<option value="'+esc(a)+'">'+esc(a)+' ('+esc(authLabel(a))+')</option>').join('')+'</select>'+
+     '<button class="topbtn" id="epexpand">展开全部</button>'+
+     '<button class="topbtn" id="epcollapse">全部收起</button>'+
+     '<button class="topbtn" id="epclear">重置</button>'+
+     '<span class="count" id="apicount"></span></div><div id="epbody"></div>';
+  return h;
+};
+function bindApi(){
+  const body=$("#epbody"); if(!body) return;
+  const q=$("#epq"),m=$("#epm"),mod=$("#epmod"),a=$("#epa"),cnt=$("#apicount");
+  const eps=arr(DATA.endpoints,"endpoints");
+  let view="tree";
+  const activeFilter=()=>!!(q.value.trim()||m.value||mod.value||a.value);
+  const match=el=>(!m.value||el.dataset.m===m.value)&&(!mod.value||el.dataset.mod===mod.value)&&
+                  (!a.value||el.dataset.auth===a.value)&&
+                  (!q.value.trim()||el.dataset.text.includes(q.value.trim().toLowerCase()));
+  function setExpanded(open){
+    $$(".epkids",body).forEach(k=>k.classList.toggle("hidden",!open));
+    $$(".ephd .caret",body).forEach(c=>{ if(c.parentElement.parentElement.querySelector(":scope > .epkids")) c.textContent=open?"▾":"▸"; });
+  }
+  function resetExpansion(){
+    $$(".epdir",body).forEach(d=>{
+      const k=d.querySelector(":scope > .epkids"); if(!k) return;
+      const open=(+d.dataset.depth)<2;
+      k.classList.toggle("hidden",!open);
+      const c=d.querySelector(":scope > .ephd .caret"); if(c) c.textContent=open?"▾":"▸";
+    });
+  }
+  function renderBody(){
+    body.innerHTML = view==="tree"
+      ? '<div id="eptree">'+apiTreeHtml(apiTree(eps),0)+'</div>'
+      : '<div id="eplist">'+eps.map(e=>epRow(e,false)).join("")+'</div>';
+  }
+  function apply(){
+    let n=0;
+    $$(".ep",body).forEach(el=>{ const ok=match(el); el.classList.toggle("hidden",!ok); if(ok) n++; });
+    if(view==="tree"){
+      $$(".epdir",body).slice().reverse().forEach(d=>{
+        const hit=$$(".ep",d).some(e=>!e.classList.contains("hidden"));
+        d.classList.toggle("hidden",!hit);
+        const k=d.querySelector(":scope > .epkids"); if(!k) return;
+        const c=d.querySelector(":scope > .ephd .caret");
+        if(activeFilter()){ k.classList.toggle("hidden",!hit); if(c) c.textContent=hit?"▾":"▸"; }
+        else if(c&&!k.classList.contains("hidden")) c.textContent="▾";
+      });
+    }
+    cnt.textContent=n+" / "+eps.length+" endpoints"+(view==="tree"?" · 前缀树":" · 列表");
+  }
+  renderBody(); resetExpansion(); apply();
+  [q,m,mod,a].forEach(el=>el.addEventListener("input",()=>{
+    if(!activeFilter()&&view==="tree") resetExpansion(); apply(); }));
+  const clr=$("#epclear"); if(clr) clr.addEventListener("click",()=>{
+    q.value="";m.value="";mod.value="";a.value=""; if(view==="tree") resetExpansion(); apply(); });
+  const ex=$("#epexpand"); if(ex) ex.addEventListener("click",()=>{ if(view==="tree"){ setExpanded(true); apply(); } });
+  const co=$("#epcollapse"); if(co) co.addEventListener("click",()=>{ if(view==="tree"){ setExpanded(false); apply(); } });
+  $$(".vtabs button").forEach(btn=>btn.addEventListener("click",()=>{
+    view=btn.dataset.view;
+    $$(".vtabs button").forEach(b=>b.classList.toggle("on",b===btn));
+    renderBody(); if(view==="tree") resetExpansion(); apply();
+  }));
+  body.addEventListener("click",ev=>{
+    const hd=ev.target.closest(".ephd");
+    if(hd){ const d=hd.parentElement,k=d.querySelector(":scope > .epkids");
+      if(k){ k.classList.toggle("hidden");
+        const c=hd.querySelector(".caret"); if(c) c.textContent=k.classList.contains("hidden")?"▸":"▾"; }
+      return; }
+    const row=ev.target.closest(".ep>.hd");
+    if(row) row.parentElement.classList.toggle("open");
+  });
+}
+
+/* ── Flows ────────────────────────────────────────────── */
+RENDER.flows=function(){
+  const f=DATA.flows||{}; const list=arr(f,"flows");
+  let h='<h1>Request Flows</h1><p class="lead">'+
+    (f.summary?rich(f.summary):'关键业务请求的逐层调用链，每一步标注源码位置。')+'</p>';
+  h+='<div class="row" style="margin-bottom:10px">'+
+     list.map(x=>'<a class="b n" href="#flows::'+esc(x.id)+'">'+esc(x.title)+'</a>').join(" ")+'</div>';
+  list.forEach(x=>{
+    h+='<div class="card" id="'+esc(x.id)+'"><div class="spread"><h3 style="margin:0">'+esc(x.title)+'</h3>'+
+       badge("n",x.kind||"flow")+'</div>'+
+       (x.summary?'<p class="small dim">'+esc(x.summary)+'</p>':'')+
+       '<ol class="chain">'+(x.steps||[]).map(s=>'<li><span class="w">'+esc(s.what)+'</span>'+
+         '<span class="s">'+src(s.source)+'</span></li>').join('')+'</ol>';
+    if((x.notes||[]).length) h+='<div class="note"><ul class="tight small">'+x.notes.map(n=>'<li>'+esc(n)+'</li>').join('')+'</ul></div>';
+    h+='</div>';
+  });
+  return h;
+};
+
+/* ── Database ─────────────────────────────────────────── */
+RENDER.database=function(){
+  const d=DATA.database||{};
+  let h='<h1>Database</h1><p class="lead">引擎 <b>'+esc(d.engine||"—")+'</b> · ORM <b>'+esc(d.orm||"—")+'</b>'+
+    (d.migrationTool?' · 迁移 <span class="mono">'+esc(d.migrationTool)+'</span>':'')+
+    (d.migrationCount?' · '+d.migrationCount+' 个迁移文件':'')+'</p>';
+  h+='<div class="grid g3">';
+  if((d.initPath||[]).length) h+='<div class="card tight"><h4>初始化路径</h4><ol class="tight small">'+
+    d.initPath.map(s=>'<li>'+esc(s.step)+' <span class="mono tiny">'+esc(s.cmd||"")+'</span></li>').join('')+'</ol></div>';
+  if(d.generation) h+='<div class="card tight"><h4>代码生成</h4><ul class="tight small">'+genRows(d.generation)+'</ul></div>';
+  if((d.groups||[]).length) h+='<div class="card tight"><h4>实体分组</h4><ul class="tight small">'+
+    d.groups.map(g=>'<li><b>'+esc(g.name)+'</b> — '+esc(g.desc||"")+' <span class="dim tiny">('+((g.tables||[]).length)+')</span></li>').join('')+'</ul></div>';
+  h+='</div>';
+  if(d.erDiagram) h+='<h2 id="db-er">核心 ER 图（简化，仅关键实体）</h2>'+
+    '<p class="small dim">只画接手必须理解的核心关系，避免蜘蛛网。完整表清单见下方。</p>'+d.erDiagram;
+  h+='<h2 id="db-tables">全部数据表</h2>'+
+     '<div class="filters"><input type="search" id="dbq" placeholder="过滤表名 / 字段 / 用途…">'+
+     '<select id="dbg"><option value="">分组: 全部</option>'+(d.groups||[]).map(g=>'<option>'+esc(g.name)+'</option>').join('')+'</select>'+
+     '<span class="count" id="dbcount"></span></div><div id="dblist">';
+  (d.tables||[]).forEach(t=>{
+    h+='<details class="dbtable" id="model-'+tid(t.name)+'" data-group="'+esc(t.group||"")+'" data-text="'+
+      esc((t.name+" "+(t.purpose||"")+" "+(t.keyFields||[]).join(" ")).toLowerCase())+'">'+
+      '<summary><span class="mono">'+esc(t.name)+'</span> '+badge("n",t.group||"")+' <span class="dim small">'+esc(t.purpose||"")+'</span></summary>'+
+      '<div class="kv">'+kv("主键",'<span class="mono">'+esc(t.pk||"—")+'</span>')+
+      kv("关键字段",'<span class="mono small">'+esc((t.keyFields||[]).join(", "))+'</span>')+
+      kv("关系",(t.relations||[]).length?'<ul class="tight small mono">'+t.relations.map(r=>'<li>'+esc(r)+'</li>').join('')+'</ul>':"—")+
+      kv("约束/索引",(t.constraints||[]).length?'<ul class="tight small mono">'+t.constraints.map(r=>'<li>'+esc(r)+'</li>').join('')+'</ul>':"—")+
+      kv("定义来源",src(t.source))+'</div></details>';
+  });
+  h+='</div>';
+  if((d.enums||[]).length){
+    h+='<h2 id="db-enums">枚举与状态字段</h2>'+tbl(["枚举/字段","取值","使用位置","说明"],
+      d.enums.map(e=>['<span class="mono">'+esc(e.name)+'</span>',
+        '<span class="mono small">'+esc((e.values||[]).join(" | "))+'</span>',src(e.source),esc(e.usedBy||"")]));
+  }
+  if((d.statusFields||[]).length){
+    h+='<h3>影响行为的状态字段</h3>'+tbl(["表","列","取值","行为影响"],
+      d.statusFields.map(s=>['<span class="mono">'+esc(s.table)+'</span>','<span class="mono">'+esc(s.column)+'</span>',
+        '<span class="mono small">'+esc(s.values)+'</span>',esc(s.behavior)]));
+  }
+  if(d.settingsSystem&&d.settingsSystem.how){
+    h+='<h2 id="db-settings">动态设置系统</h2><div class="card"><p class="small">'+esc(d.settingsSystem.how)+'</p>'+
+      '<p class="small">'+src(d.settingsSystem.source)+'</p></div>';
+  }
+  if((d.notes||[]).length) h+='<div class="note warn"><ul class="tight small">'+d.notes.map(n=>'<li>'+esc(n)+'</li>').join('')+'</ul></div>';
+  return h;
+};
+function bindDatabase(){
+  const list=$("#dblist"); if(!list) return;
+  const q=$("#dbq"),g=$("#dbg"),cnt=$("#dbcount");
+  function apply(){ const Q=q.value.trim().toLowerCase(),G=g.value; let n=0;
+    $$(".dbtable",list).forEach(el=>{ const ok=(!G||el.dataset.group===G)&&(!Q||el.dataset.text.includes(Q));
+      el.style.display=ok?"":"none"; if(ok)n++; });
+    cnt.textContent=n+" / "+DATA.database.tables.length+" tables"; }
+  [q,g].forEach(el=>el.addEventListener("input",apply)); apply();
+}
+
+/* ── Config ───────────────────────────────────────────── */
+RENDER.config=function(){
+  const c=DATA.config||{};
+  let h='<h1>Configuration</h1>'+(c.intro?'<p class="lead">'+rich(c.intro)+'</p>':'');
+  if(c.loader){
+    h+='<div class="note ok">'+Object.keys(c.loader).map(k=>'<b>'+esc(LOADER_LABELS[k]||k)+'：</b>'+rich(c.loader[k])+'<br>').join('')+'</div>';
+  }
+  h+='<div class="filters"><input type="search" id="cfq" placeholder="过滤配置项 / 说明…"><span class="count" id="cfcount"></span></div>';
+  h+='<div id="cflist">'+tbl(["配置段","键","代码字段","必填","默认值","用途","源码"],
+    (c.items||[]).map(i=>['<span class="mono">'+esc(i.section||"")+'</span>','<span class="mono">'+esc(i.key)+'</span>',
+      '<span class="mono small">'+esc(i.rustField||"")+'</span>',(i.required?badge("danger","必填"):badge("n","可选")),
+      '<span class="mono small">'+esc(i.default==null?"—":i.default)+'</span>',esc(i.purpose||""),src(i.source)]),
+    null,
+    (c.items||[]).map(i=>'class="cfrow" data-text="'+esc(((i.section||"")+" "+i.key+" "+(i.rustField||"")+" "+(i.purpose||"")).toLowerCase())+'"'))+'</div>';
+  const ds=c.dynamicSettings;
+  if(ds&&(ds.defaults||[]).length){
+    h+='<h2 id="cfg-settings">运行期动态配置</h2>'+(ds.note?'<p class="small dim">'+ds.note+' '+src(ds.source)+'</p>':'')+
+      tbl(["Key","类型","默认值","用途"],ds.defaults.map(s=>['<span class="mono">'+esc(s.key)+'</span>',esc(s.type||""),
+        '<span class="mono small">'+esc(s.default)+'</span>',esc(s.purpose||"")]));
+  }
+  if(c.sidecarEnv){
+    h+='<h2 id="cfg-sidecar">由进程注入的环境变量</h2>'+(c.sidecarEnv.note?'<p class="small dim">'+esc(c.sidecarEnv.note)+'</p>':'');
+    Object.keys(c.sidecarEnv).forEach(k=>{ if(k==="note") return;
+      h+='<h3>'+esc(k)+'</h3>'+tbl(["变量","来源","用途"],
+        (c.sidecarEnv[k]||[]).map(e=>['<span class="mono">'+esc(e.name)+'</span>',src(e.source),esc(e.purpose||"")])); });
+  }
+  if((c.notes||[]).length) h+='<div class="note warn"><ul class="tight small">'+c.notes.map(n=>'<li>'+esc(n)+'</li>').join('')+'</ul></div>';
+  return h;
+};
+function bindConfig(){
+  const q=$("#cfq"),cnt=$("#cfcount"); if(!q) return;
+  function apply(){ const Q=q.value.trim().toLowerCase(); let n=0;
+    $$(".cfrow").forEach(r=>{ const ok=!Q||r.dataset.text.includes(Q); r.style.display=ok?"":"none"; if(ok)n++; });
+    cnt.textContent=n+" / "+(DATA.config.items||[]).length; }
+  q.addEventListener("input",apply); apply();
+}
+
+/* ── Auth ─────────────────────────────────────────────── */
+RENDER.auth=function(){
+  const a=DATA.auth||{};
+  let h='<h1>Authentication &amp; Authorization</h1>'+(a.summary?'<p class="lead">'+rich(a.summary)+'</p>':'');
+  if(a.chain) h+='<h2 id="auth-chain">认证链</h2><div class="diagram">'+a.chain+'</div>';
+  if((a.mechanisms||[]).length){
+    h+='<h2 id="auth-mechanisms">机制</h2>'+tbl(["机制","实现","凭据位置","适用面","源码"],
+      a.mechanisms.map(m=>['<b>'+esc(m.name)+'</b>',rich(m.how),'<span class="mono small">'+esc(m.storage||"")+'</span>',
+        esc(m.scope||""),src(m.source)]));
+  }
+  if((a.matrix||[]).length){
+    h+='<h2 id="auth-matrix">访问控制矩阵</h2>'+tbl(["认证级别","端点数","含义","代表端点"],
+      a.matrix.map(m=>[authBadge(m.auth)+' '+esc(authLabel(m.auth)),'<span class="num">'+esc(m.count)+'</span>',
+        esc(m.meaning||""),'<span class="mono small">'+((m.examples||[]).map(esc).join('<br>')||"—")+'</span>']));
+  }
+  if((a.publicEndpoints||[]).length){
+    h+='<h2 id="auth-public">无需认证的端点</h2>'+tbl(["Method","Path","Handler","源码"],
+      a.publicEndpoints.map(e=>[mbadge(e.method),'<span class="mono">'+esc(e.path)+'</span>',
+        '<span class="mono">'+esc(e.handler)+'</span>',src(e.file,e.line)]));
+  }
+  if(a.internal) h+='<h2 id="auth-internal">内部服务鉴权</h2>'+a.internal;
+  if((a.authorization||[]).length){
+    h+='<h2 id="authz">授权（角色之外）</h2><div class="grid g2">'+
+      a.authorization.map(x=>'<div class="card tight"><h4>'+esc(x.title)+'</h4><p class="small">'+(x.text||"")+'</p>'+
+        (x.src?'<div class="small">'+src(x.src,x.line)+'</div>':'')+'</div>').join('')+'</div>';
+  }
+  if((a.notes||[]).length) h+='<div class="note warn"><ul class="tight small">'+a.notes.map(n=>'<li>'+n+'</li>').join('')+'</ul></div>';
+  return h;
+};
+
+/* ── Frontend ─────────────────────────────────────────── */
+RENDER.frontend=function(){
+  const f=DATA.frontend||{};
+  let h='<h1>Frontend</h1>'+(f.summary?'<p class="lead">'+rich(f.summary)+'</p>':'');
+  const st=f.stack||{};
+  const tiles=Object.keys(st).filter(k=>st[k]);
+  if(tiles.length) h+='<div class="grid g4">'+tiles.map(k=>
+    '<div class="stat"><div class="l">'+esc(STACK_LABELS[k]||k)+'</div><div class="mono" style="font-size:12.5px;margin-top:3px">'+esc(st[k])+'</div></div>').join('')+'</div>';
+  if(f.dataFlowDiagram) h+='<h2 id="fe-dataflow">数据流</h2>'+f.dataFlowDiagram;
+  if((f.pages||[]).length){
+    const groups=[...new Set(f.pages.map(p=>p.group).filter(Boolean))];
+    h+='<h2 id="fe-pages">页面路由表</h2><div class="filters">'+
+       '<input type="search" id="pgq" placeholder="过滤路由 / 组件 / API…">'+
+       (groups.length?'<select id="pgg"><option value="">区域: 全部</option>'+groups.map(g=>'<option>'+esc(g)+'</option>').join('')+'</select>':'')+
+       '<span class="count" id="pgcount"></span></div><div id="pglist">'+
+       tbl(["URL","页面组件","源码","区域","调用的后端 API"],
+         f.pages.map(p=>['<span class="mono">'+esc(p.route)+'</span>',esc(p.component||""),src(p.file),
+           badge("n",p.group||""),'<span class="mono tiny">'+(((p.apis||[]).length)?p.apis.map(esc).join('<br>'):'<span class="dim">— 未确认</span>')+'</span>']),
+         null,
+         f.pages.map(p=>'class="pgrow" data-g="'+esc(p.group||"")+'" data-text="'+
+           esc((p.route+" "+(p.component||"")+" "+p.file+" "+(p.apis||[]).join(" ")).toLowerCase())+'"'))+'</div>';
+  }
+  if(f.apiClient&&(f.apiClient.files||[]).length){
+    h+='<h2 id="fe-api">API 客户端层</h2>'+tbl(["文件","职责","说明"],
+      f.apiClient.files.map(x=>[src(x.path),esc(x.role||""),esc(x.notes||"")]));
+    if(f.apiClient.authTokenStorage||f.apiClient.interceptors){
+      h+='<div class="card tight small">'+
+        (f.apiClient.authTokenStorage?'<p><b>凭据存储：</b>'+esc(f.apiClient.authTokenStorage)+'</p>':'')+
+        (f.apiClient.interceptors?'<p><b>拦截器：</b>'+esc(f.apiClient.interceptors)+'</p>':'')+
+        (f.apiClient.errorEnvelope?'<p><b>错误信封：</b>'+esc(f.apiClient.errorEnvelope)+'</p>':'')+'</div>';
+    }
+  }
+  if((f.stores||[]).length) h+='<h3>状态存储</h3>'+tbl(["文件","职责","持久化","使用者"],
+    f.stores.map(s=>[src(s.path),esc(s.role||""),esc(s.persistedState||"—"),esc(s.usedBy||"")]));
+  if((f.sse||[]).length) h+='<h2 id="fe-sse">实时通信</h2>'+tbl(["Hook / 机制","后端端点","用途","源码"],
+    f.sse.map(s=>['<span class="mono">'+esc(s.hook)+'</span>','<span class="mono">'+esc(s.endpoint)+'</span>',esc(s.purpose||""),src(s.file)]));
+  if(f.navigation){
+    h+='<h2 id="fe-nav">导航与布局</h2><div class="card">'+
+      Object.keys(f.navigation).filter(k=>k!=="files"&&f.navigation[k]).map(k=>
+        '<p class="small"><b>'+esc(k)+'：</b>'+esc(f.navigation[k])+'</p>').join('')+'</div>';
+  }
+  if((f.quirks||[]).length) h+='<h2 id="fe-quirks">前端注意点</h2><ul class="tight small">'+f.quirks.map(q=>'<li>'+q+'</li>').join('')+'</ul>';
+  if((f.notes||[]).length) h+='<div class="note warn"><ul class="tight small">'+f.notes.map(n=>'<li>'+esc(n)+'</li>').join('')+'</ul></div>';
+  return h;
+};
+function bindFrontend(){
+  const list=$("#pglist"); if(!list) return;
+  const q=$("#pgq"),g=$("#pgg"),cnt=$("#pgcount");
+  function apply(){ const Q=q.value.trim().toLowerCase(),G=g?g.value:""; let n=0;
+    $$(".pgrow",list).forEach(r=>{ const ok=(!G||r.dataset.g===G)&&(!Q||r.dataset.text.includes(Q));
+      r.style.display=ok?"":"none"; if(ok)n++; });
+    cnt.textContent=n+" / "+DATA.frontend.pages.length+" pages"; }
+  [q,g].filter(Boolean).forEach(el=>el.addEventListener("input",apply)); apply();
+}
+
+/* ── Jobs ─────────────────────────────────────────────── */
+RENDER.jobs=function(){
+  const j=DATA.jobs||{};
+  let h='<h1>Background Jobs</h1>'+(j.summary?'<p class="lead">'+rich(j.summary)+'</p>':'');
+  if(j.engine){
+    h+='<h2 id="jobs-engine">调度引擎</h2><div class="card"><p class="small">'+(j.engine.how||"")+'</p><div class="kv">'+
+      ["persistence|持久化","pollInterval|轮询","wake|即时唤醒"].map(s=>{const [k,l]=s.split("|");
+        return j.engine[k]?kv(l,esc(j.engine[k])):""; }).join('')+
+      ((j.engine.files||[]).length?kv("核心源码",j.engine.files.map(f=>src(f.path)+' <span class="dim small">'+esc(f.role||"")+'</span>').join('<br>')):"")+
+      '</div></div>';
+  }
+  if((j.tasks||[]).length){
+    h+='<h2 id="jobs-tasks">任务清单</h2>'+tbl(["任务","触发方式","处理器","依赖","用途","源码"],
+      j.tasks.map(t=>['<span class="mono">'+esc(t.key)+'</span>',t.trigger||"",'<span class="mono small">'+esc(t.handler||"")+'</span>',
+        '<span class="small">'+esc(t.dependency||"")+'</span>',esc(t.purpose||""),src(t.source)]));
+  }
+  if((j.lifecycle||[]).length){
+    h+='<h2 id="jobs-lifecycle">任务生命周期</h2><ol class="chain">'+
+      j.lifecycle.map(s=>'<li><span class="w">'+esc(s.what)+'</span><span class="s">'+src(s.source)+'</span></li>').join('')+'</ol>';
+  }
+  if((j.streams||[]).length){
+    h+='<h2 id="jobs-streams">实时事件流</h2>'+tbl(["端点","方向","载荷","源码"],
+      j.streams.map(s=>['<span class="mono">'+esc(s.endpoint)+'</span>',esc(s.dir||""),esc(s.payload||""),src(s.source)]));
+  }
+  if((j.notes||[]).length) h+='<div class="note warn"><ul class="tight small">'+j.notes.map(n=>'<li>'+esc(n)+'</li>').join('')+'</ul></div>';
+  return h;
+};
+
+/* ── Dependencies ─────────────────────────────────────── */
+RENDER.deps=function(){
+  const d=DATA.deps||{};
+  let h='<h1>Dependencies</h1>'+(d.summary?'<p class="lead">'+rich(d.summary)+'</p>':'');
+  (d.groups||[]).forEach(g=>{
+    h+='<h2 id="dep-'+slugify(g.name)+'">'+esc(g.name)+'</h2>'+(g.desc?'<p class="small dim">'+esc(g.desc)+'</p>':'')+
+       tbl(["依赖","版本/形态","在项目中的实际用途","引入位置"],
+         (g.items||[]).map(i=>['<b class="mono">'+esc(i.name)+'</b>','<span class="mono small">'+esc(i.version||"")+'</span>',
+           rich(i.usage),i.source?src(i.source):"—"]));
+  });
+  if((d.externalServices||[]).length){
+    h+='<h2 id="dep-external">外部服务与基础设施</h2>'+tbl(["服务","形态","用途","必需性","证据"],
+      d.externalServices.map(s=>['<b>'+esc(s.name)+'</b>',esc(s.form||""),esc(s.usage||""),
+        (s.required===true||s.required==="true")?badge("danger","必需"):badge("n",String(s.required||"可选")),src(s.source)]));
+  }
+  if((d.notes||[]).length) h+='<div class="note warn"><ul class="tight small">'+d.notes.map(n=>'<li>'+esc(n)+'</li>').join('')+'</ul></div>';
+  return h;
+};
+
+/* ── Deploy ───────────────────────────────────────────── */
+RENDER.deploy=function(){
+  const d=DATA.deploy||{};
+  let h='<h1>Build &amp; Deployment</h1>'+(d.summary?'<p class="lead">'+rich(d.summary)+'</p>':'');
+  if(d.dev){
+    h+='<h2 id="dep-dev">Development</h2><pre>'+esc(d.dev.flow||"")+'</pre><div class="card">'+
+       (d.dev.notes?'<p class="small">'+esc(d.dev.notes)+'</p>':'')+'<div class="kv">'+
+       (d.dev.entry?kv("入口",'<span class="mono">'+esc(d.dev.entry)+'</span>'):"")+
+       ((d.dev.commands||[]).length?kv("命令",d.dev.commands.map(c=>'<span class="mono">'+esc(c)+'</span>').join("<br>")):"")+
+       '</div></div>';
+  }
+  if(d.prod){
+    h+='<h2 id="dep-prod">Production</h2><pre>'+esc(d.prod.flow||"")+'</pre><div class="card">'+
+       (d.prod.notes?'<p class="small">'+esc(d.prod.notes)+'</p>':'')+'<div class="kv">'+
+       ["installer|安装器","home|运行根","compose|Compose"].map(s=>{const [k,l]=s.split("|");
+         return d.prod[k]?kv(l,'<span class="mono">'+esc(d.prod[k])+'</span>'):""; }).join('')+
+       ((d.prod.systemdUnits||[]).length?kv("systemd",d.prod.systemdUnits.map(u=>'<span class="mono">'+esc(u)+'</span>').join("<br>")):"")+
+       ((d.prod.networks||[]).length?kv("网络",d.prod.networks.map(u=>'<span class="mono">'+esc(u)+'</span>').join("<br>")):"")+
+       '</div></div>';
+    if((d.prod.services||[]).length){
+      h+='<h2 id="dep-services">生产服务拓扑</h2>'+tbl(["服务","镜像/来源","端口","用户","安全约束","用途"],
+        d.prod.services.map(s=>['<b>'+esc(s.name)+'</b>','<span class="mono small">'+esc(s.image||"")+'</span>',
+          '<span class="mono small">'+esc(s.ports||"—")+'</span>','<span class="mono small">'+esc(s.user||"—")+'</span>',
+          '<span class="small">'+esc(s.security||"—")+'</span>',esc(s.purpose||"")]));
+    }
+  }
+  if(d.ci&&(d.ci.workflows||[]).length){
+    h+='<h2 id="dep-ci">CI / CD</h2>'+d.ci.workflows.map(w=>'<div class="card"><h4>'+esc(w.name||"")+
+      ' <span class="mono small dim">'+esc(w.path||"")+'</span></h4>'+
+      (w.triggers?'<p class="small"><b>触发：</b><span class="mono">'+esc(w.triggers)+'</span></p>':'')+
+      tbl(["Job","Runner","步骤","是否门禁"],(w.jobs||[]).map(j=>['<b>'+esc(j.job)+'</b>',
+        '<span class="mono small">'+esc(j.runsOn||"")+'</span>',
+        '<span class="mono tiny">'+((j.steps||[]).map(esc).join('<br>'))+'</span>',
+        j.gated?badge("danger","是"):badge("n","否/跳过")]))+'</div>').join('');
+    if((d.ci.gateCommands||[]).length) h+='<h3>实际门禁命令</h3><pre>'+esc(d.ci.gateCommands.join("\n"))+'</pre>';
+    if(d.ci.notes) h+='<div class="note"><ul class="tight small">'+(Array.isArray(d.ci.notes)?d.ci.notes:d.ci.notes.split("\n")).map(n=>'<li>'+esc(n)+'</li>').join('')+'</ul></div>';
+  }
+  if((d.dockerfiles||[]).length){
+    h+='<h2 id="dep-dockerfiles">Dockerfile</h2>'+tbl(["文件","用途","基础镜像","说明"],
+      d.dockerfiles.map(x=>[src(x.path),esc(x.purpose||""),'<span class="mono small">'+esc(x.base||"")+'</span>',esc(x.notes||"")]));
+  }
+  if((d.notes||[]).length) h+='<div class="note warn"><ul class="tight small">'+d.notes.map(n=>'<li>'+n+'</li>').join('')+'</ul></div>';
+  return h;
+};
+
+/* ── Entry points ─────────────────────────────────────── */
+RENDER.entry=function(){
+  const e=DATA.entry||{};
+  let h='<h1>Where should I start reading?</h1>'+(e.summary?'<p class="lead">'+esc(e.summary)+'</p>':'');
+  if((e.order||[]).length){
+    h+='<h2 id="en-order">推荐阅读顺序</h2><ol class="chain">'+
+      e.order.map(s=>'<li><span class="w"><span class="mono">'+src(s.path,s.line)+'</span> — '+esc(s.why)+'</span></li>').join('')+'</ol>';
+  }
+  (e.groups||[]).forEach(g=>{
+    h+='<h2 id="en-'+slugify(g.title)+'">'+esc(g.title)+'</h2><div class="card"><ul class="tight">'+
+      (g.items||[]).map(i=>'<li><span class="mono">'+src(i.path,i.line)+'</span> — '+esc(i.why)+'</li>').join('')+'</ul></div>';
+  });
+  return h;
+};
+
+/* ── Risks ────────────────────────────────────────────── */
+RENDER.risks=function(){
+  const r=DATA.risks||{};
+  let h='<h1>Risks / Notes</h1>'+(r.summary?'<p class="lead">'+rich(r.summary)+'</p>':'');
+  (r.risks||[]).forEach(x=>{
+    h+='<div class="card" id="risk-'+slugify(x.title)+'">'+
+      '<div class="spread"><h3 style="margin:0">'+esc(x.title)+'</h3><span>'+
+      badge(sevCls(x.severity),esc(x.severity||"?")+" 风险")+badge("n",x.kind||"")+'</span></div>'+
+      '<h4>现象</h4><p class="small">'+rich(x.phenomenon||x["现象"])+'</p>'+
+      '<h4>源码位置</h4><p class="small">'+((x.sources||[]).map(s=>src(s)).join('<br>')||"—")+'</p>'+
+      '<h4>对理解项目的影响</h4><p class="small">'+(x.impact||"")+'</p>'+
+      (x.advice?'<div class="note"><b>接手建议：</b>'+rich(x.advice)+'</div>':'')+'</div>';
+  });
+  if((DATA.unconfirmed||[]).length){
+    h+='<h2 id="risk-unconfirmed">未确认事项（显式标记）</h2><div class="note warn"><ul class="tight small">'+
+       DATA.unconfirmed.map(u=>'<li>'+u+'</li>').join('')+'</ul></div>';
+  }
+  return h;
+};
+
+/* ── global search ────────────────────────────────────── */
+function buildIndex(){
+  const idx=[];
+  const push=(kind,title,sub,page,anchor)=>idx.push({kind:kind,title:title,sub:sub||"",page:page,anchor:anchor||""});
+  arr(DATA.endpoints,"endpoints").forEach(e=>push("API",e.method+" "+e.path,(e.module||"")+" · "+e.handler,"api","api-"+e.id));
+  ((DATA.modules&&DATA.modules.modules)||[]).forEach(m=>{
+    push("模块",m.name,m.responsibility,"modules","module-"+slugify(m.name));
+    (m.keySymbols||[]).forEach(s=>push("符号",s.name,m.name+" · "+(s.kind||""),"modules","module-"+slugify(m.name)));
+    (m.keyFiles||[]).forEach(f=>push("文件",f.path,m.name,"modules","module-"+slugify(m.name)));
+  });
+  ((DATA.database&&DATA.database.tables)||[]).forEach(t=>push("模型","db:"+t.name,t.purpose||"","database","model-"+tid(t.name)));
+  ((DATA.database&&DATA.database.enums)||[]).forEach(e=>push("枚举",e.name,(e.values||[]).join("|"),"database","db-enums"));
+  ((DATA.config&&DATA.config.items)||[]).forEach(i=>push("配置",(i.section?i.section+".":"")+i.key,i.purpose||"","config","cf-settings"));
+  const ds=DATA.config&&DATA.config.dynamicSettings;
+  if(ds) (ds.defaults||[]).forEach(s=>push("设置",s.key,s.purpose||"","config","cfg-settings"));
+  if(DATA.config&&DATA.config.sidecarEnv) Object.keys(DATA.config.sidecarEnv).forEach(k=>{ if(k==="note") return;
+    (DATA.config.sidecarEnv[k]||[]).forEach(e=>push("环境变量",e.name,k,"config","cfg-sidecar")); });
+  arr(DATA.flows,"flows").forEach(f=>{ push("流程",f.title,f.summary||"","flows",f.id);
+    (f.steps||[]).forEach(s=>push("步骤",s.what,f.title,"flows",f.id)); });
+  ((DATA.frontend&&DATA.frontend.pages)||[]).forEach(p=>push("页面",p.route,(p.component||"")+" · "+p.file,"frontend",""));
+  ((DATA.frontend&&DATA.frontend.sse)||[]).forEach(s=>push("实时",s.hook,s.endpoint||"","frontend","fe-sse"));
+  ((DATA.jobs&&DATA.jobs.tasks)||[]).forEach(t=>push("任务",t.key,t.purpose||"","jobs","jobs-tasks"));
+  ((DATA.deps&&DATA.deps.groups)||[]).forEach(g=>(g.items||[]).forEach(i=>push("依赖",i.name,g.name,"deps","dep-"+slugify(g.name))));
+  ((DATA.risks&&DATA.risks.risks)||[]).forEach(r=>push("风险",r.title,r.kind||"","risks","risk-"+slugify(r.title)));
+  ((DATA.entry&&DATA.entry.order)||[]).forEach(s=>push("入口",s.path,s.why||"","entry","en-order"));
+  (function walk(n){ if(n.path!=="."){
+      const anc="dir-"+slugify(n.path);
+      push(n.type==="dir"?"目录":"文件",n.path,n.role||"","files",anc);
+      if(n.core) push("核心文件",n.path,n.role||"","files",n.type==="dir"?anc:"file-"+slugify(n.path)); }
+    (n.children||[]).forEach(walk); })(DATA.tree||{path:".",children:[]});
+  return idx;
+}
+let INDEX=[];
+function doSearch(q){
+  const terms=q.trim().split(/\s+/).filter(Boolean);
+  if(!terms.length) return [];
+  const scored=[];
+  for(const it of INDEX){
+    let total=0, ok=true;
+    for(const t of terms){
+      const a=fuzzy(it.title,t), b=fuzzy(it.sub,t)*0.35, c=(it.kind.toLowerCase()===t.toLowerCase())?500:0;
+      const best=Math.max(a,b,c);
+      if(best<0){ ok=false; break; }
+      total+=best;
+    }
+    if(ok) scored.push([total,it]);
+  }
+  scored.sort((x,y)=>y[0]-x[0]);
+  return scored.slice(0,60).map(x=>x[1]);
+}
+function bindSearch(){
+  const inp=$("#gsearch"),box=$("#results");
+  let sel=-1,cur=[];
+  const close=()=>{box.classList.remove("open");sel=-1;cur=[];};
+  function render(items,q){
+    cur=items;
+    if(!q.trim()){ close(); return; }
+    if(!items.length){ box.innerHTML='<div class="empty">无匹配结果</div>'; box.classList.add("open"); return; }
+    const terms=q.trim().split(/\s+/);
+    box.innerHTML=items.map((it,i)=>'<div class="res'+(i===sel?" sel":"")+'" data-i="'+i+'">'+
+      '<span class="k">'+esc(it.kind)+'</span><span class="t">'+hl(it.title,terms)+'</span>'+
+      (it.sub?'<span class="s">'+esc(it.sub)+'</span>':'')+'</div>').join('');
+    box.classList.add("open");
+  }
+  function go(it){ location.hash = it.anchor ? it.page+"::"+it.anchor : it.page; }
+  inp.addEventListener("input",()=>{ sel=-1; render(doSearch(inp.value),inp.value); });
+  inp.addEventListener("focus",()=>{ if(inp.value.trim()) render(doSearch(inp.value),inp.value); });
+  inp.addEventListener("keydown",ev=>{
+    if(ev.key==="ArrowDown"||ev.key==="ArrowUp"){ ev.preventDefault();
+      if(!cur.length) return; sel=(sel+(ev.key==="ArrowDown"?1:-1)+cur.length)%cur.length;
+      render(cur,inp.value); return; }
+    if(ev.key==="Enter"){ const t=cur[sel>=0?sel:0]; if(t){ go(t); close(); inp.blur(); } return; }
+    if(ev.key==="Escape"){ close(); inp.blur(); }
+  });
+  box.addEventListener("click",ev=>{ const r=ev.target.closest(".res"); if(!r) return; go(cur[+r.dataset.i]); close(); });
+  document.addEventListener("click",ev=>{ if(!$("#searchwrap").contains(ev.target)) close(); });
+  document.addEventListener("keydown",ev=>{
+    if((ev.ctrlKey||ev.metaKey)&&ev.key.toLowerCase()==="k"){ ev.preventDefault(); inp.focus(); inp.select(); }
+    if(ev.key==="Escape") close();
+  });
+}
+
+/* ── router / theme / copy ────────────────────────────── */
+function currentPage(){
+  const page=location.hash.replace(/^#/,"").split("::")[0];
+  return PAGES.some(p=>p.id===page) ? page : (PAGES[0]||{id:"overview"}).id;
+}
+function renderAll(){
+  $("#main").innerHTML=PAGES.map(p=>'<section class="page" id="page-'+p.id+'">'+
+    (RENDER[p.id]?RENDER[p.id]():'')+'</section>').join('');
+  [bindFiles,bindApi,bindModules,bindDatabase,bindConfig,bindFrontend].forEach(fn=>{
+    try{ fn(); }catch(e){ console.error("section binder failed",e); }
+  });
+  INDEX=buildIndex();
+  bindSearch();
+  const groups=[];
+  PAGES.forEach(p=>{ const last=groups[groups.length-1];
+    if(!last||last.name!==p.group) groups.push({name:p.group,items:[p]}); else last.items.push(p); });
+  $("#sidebar").innerHTML=groups.map(g=>'<div class="grp">'+esc(g.name)+'</div>'+
+    g.items.map(p=>'<a data-page="'+p.id+'" href="#'+p.id+'"><span>'+p.icon+'</span>'+esc(p.label)+'</a>').join('')).join('');
+  bindCopy();
+  route();
+}
+function route(){
+  const h=location.hash.replace(/^#/,"");
+  const page=currentPage();
+  const anchor=h.split("::")[1]||"";
+  $$(".page").forEach(s=>s.classList.toggle("active",s.id==="page-"+page));
+  $$("#sidebar a").forEach(a=>a.classList.toggle("active",a.dataset.page===page));
+  window.scrollTo(0,0);
+  if(!anchor) return;
+  const el=document.getElementById(anchor);
+  if(!el) return;
+  if(anchor.indexOf("file-")===0||anchor.indexOf("dir-")===0){
+    let p=el.closest(".ftdir");
+    while(p){ const k=p.parentElement;
+      if(k&&k.classList.contains("ftkids")){ k.classList.remove("hidden");
+        const c=p.querySelector(":scope > .ftn .caret"); if(c) c.textContent="▾"; }
+      p=k?k.closest(".ftdir"):null; }
+    if(el.classList.contains("ftn")) el.click();
+  }
+  if(el.tagName==="DETAILS") el.open=true;
+  const d=el.closest("details"); if(d) d.open=true;
+  const e=el.closest(".ep");
+  if(e){ e.classList.add("open");
+    let p=e.parentElement;
+    while(p){ if(p.classList&&p.classList.contains("epkids")){ p.classList.remove("hidden");
+        const c=p.parentElement&&p.parentElement.querySelector(":scope > .ephd .caret");
+        if(c) c.textContent="▾"; }
+      p=p.parentElement; }
+  }
+  setTimeout(()=>{ el.scrollIntoView({block:"start",behavior:"smooth"}); flash(el); },30);
+}
+function flash(el){
+  const old=el.style.background;
+  el.style.background="var(--accent-soft)";
+  setTimeout(()=>{ el.style.background=old; },900);
+}
+function bindCopy(){
+  document.addEventListener("click",ev=>{
+    const s=ev.target.closest(".src"); if(!s) return;
+    const txt=s.dataset.copy;
+    const done=()=>{ const o=s.textContent; s.classList.add("copied"); s.textContent="✓ "+txt;
+      setTimeout(()=>{ s.textContent=o; s.classList.remove("copied"); },900); };
+    if(navigator.clipboard&&navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(done,done);
+    else { const ta=document.createElement("textarea"); ta.value=txt; document.body.appendChild(ta); ta.select();
+      try{ document.execCommand("copy"); }catch(e){} document.body.removeChild(ta); done(); }
+  });
+}
+function applyTheme(t){
+  document.documentElement.dataset.theme =
+    t==="auto" ? (matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light") : t;
+}
+function initTheme(){
+  applyTheme(localStorage.getItem("fctf-theme")||"light");
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change",()=>{
+    if((localStorage.getItem("fctf-theme")||"light")==="auto") applyTheme("auto"); });
+  $("#themebtn").addEventListener("click",()=>{
+    const next=document.documentElement.dataset.theme==="dark"?"light":"dark";
+    localStorage.setItem("fctf-theme",next); applyTheme(next);
+  });
+}
+$("#menubtn").addEventListener("click",()=>$("#sidebar").classList.toggle("open"));
+if(matchMedia("(max-width:860px)").matches) $("#menubtn").style.display="";
+window.addEventListener("hashchange",route);
+initTheme();
+renderAll();
+</script>
+</body>
+</html>
